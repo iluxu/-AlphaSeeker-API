@@ -224,7 +224,12 @@ class ScanRequest(BaseModel):
     min_gpt_confidence: float = Field(default=0.65, ge=0, le=1) # From user JSON
     min_backtest_score: float = Field(default=0.60, ge=0, le=1) # From user JSON
     trade_direction: Optional[str] = Field(default=None, pattern="^(long|short)$") # null in user JSON -> default None
-
+    
+        # --- NEW BTC TREND FILTER ---
+    filter_by_btc_trend: Optional[bool] = Field(default=True, description="If True, only show LONG signals if BTC is in Uptrend, and SHORT signals if BTC is in Downtrend (based on Price/SMA50/SMA200).")
+    # --- END NEW BTC TREND FILTER ---
+    
+    
     # --- New Backtest Filters (from user JSON) ---
     min_backtest_trades: Optional[int] = Field(default=15, ge=0) # From user JSON
     min_backtest_win_rate: Optional[float] = Field(default=0.52, ge=0, le=1) # From user JSON
@@ -1290,46 +1295,122 @@ async def analyze_crypto_endpoint(request: AnalysisRequest):
 
 
 # Scan (Updated to use modified AnalysisRequest/perform_single_analysis, logging enhanced)
+# --- Scan Endpoint (Updated Filtering Logic) ---
 @app.post("/api/crypto/scan", response_model=ScanResponse, tags=["Scanning"])
 async def scan_market_endpoint(request: ScanRequest):
     logger.critical("--- SCAN ENDPOINT ENTERED ---")
     scan_start_time = time.time()
-    # Log the actual request received, excluding defaults if needed for clarity
+    # Log the actual request received, including defaults for clarity on what's active
     logger.info(f"API Scan: Starting request: {request.model_dump_json(exclude_defaults=False)}")
 
-    # --- Lookback Warning (Keep this check) ---
+    # --- Lookback Warning ---
     if request.timeframe == '1m' and request.lookback > 1500:
          logger.warning(f"API Scan: Lookback {request.lookback} for 1m timeframe might exceed fetch limits (~1500). Analysis might use fewer candles.")
     elif request.lookback > 1500:
          logger.warning(f"API Scan: Lookback {request.lookback} might exceed typical fetch limits (~1500).")
 
-    # --- Basic Setup Checks (Keep as is) ---
-    # ... (Check CCXT, OpenAI, Load Markets) ...
-    if binance_futures is None: logger.error("..."); raise HTTPException(503, ...)
-    if not binance_futures.markets: logger.warning("..."); await load_exchange_markets(binance_futures); # etc.
+    # --- Basic Setup Checks ---
+    if binance_futures is None:
+        logger.error("API Scan Abort: Exchange unavailable.")
+        raise HTTPException(status_code=503, detail="Exchange unavailable")
+    # Note: OpenAI client presence is checked within perform_single_analysis if needed
+    if not binance_futures.markets:
+        logger.warning("API Scan: Markets not loaded, attempting load...")
+        if not await load_exchange_markets(binance_futures):
+            logger.error("API Scan Abort: Failed load markets.")
+            raise HTTPException(status_code=503, detail="Failed load markets.")
 
-    # --- 1. Get Tickers (Keep as is) ---
+    # --- 1. Get Tickers ---
     try:
-        # ... (Get all_tickers) ...
         markets = binance_futures.markets
-        if not markets: logger.error("..."); raise ValueError("...")
+        if not markets:
+            logger.error("API Scan Abort: Markets dictionary empty after load attempt.")
+            raise ValueError("Markets unavailable post-load.")
         all_tickers = sorted([m['symbol'] for m in markets.values() if m.get('swap') and m.get('quote')=='USDT' and m.get('settle')=='USDT' and m.get('active')])
         logger.info(f"API Scan: Found {len(all_tickers)} active USDT perpetuals.")
-        if not all_tickers: logger.warning("..."); return ScanResponse(...)
-    except Exception as e: logger.error("..."); raise HTTPException(502, ...)
+        if not all_tickers:
+            logger.warning("API Scan: No active USDT perpetuals found. Scan finished.")
+            return ScanResponse(scan_parameters=request, total_tickers_attempted=0, total_tickers_succeeded=0,
+                                ticker_start_index=request.ticker_start_index, ticker_end_index=request.ticker_end_index,
+                                total_opportunities_found=0, top_opportunities=[], errors={})
+    except Exception as e:
+        logger.error(f"API Scan Tickers Error: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Ticker retrieval error: {e}")
 
-    # --- 2. Select Tickers (Keep as is, respecting request.ticker_start/end/max) ---
-    # This part correctly handles slicing based on start_index, end_index, max_tickers
+    # --- 2. Determine BTC Trend (Market Regime) ---
+    btc_trend_state = "UNKNOWN" # Default: unknown/error/filter disabled
+    apply_btc_filter = request.filter_by_btc_trend # Check if filter is requested
+
+    if apply_btc_filter:
+        logger.info(f"API Scan: BTC Trend filter enabled. Fetching BTC data for timeframe {request.timeframe}...")
+        try:
+            # Fetch sufficient data for SMAs on the requested timeframe
+            btc_symbol = "BTC/USDT:USDT"
+            # Ensure enough lookback for SMA 200 + buffer, respecting potential 1m limit
+            btc_lookback = max(250, request.lookback)
+            if request.timeframe == '1m' and btc_lookback > 1500:
+                 logger.warning("Capping BTC lookback fetch for 1m timeframe to 1500")
+                 btc_lookback = 1500
+            elif btc_lookback > 1500:
+                 logger.warning(f"BTC lookback {btc_lookback} might exceed limits, attempting fetch...")
+
+
+            df_btc_raw = await asyncio.to_thread(get_real_time_data, btc_symbol, request.timeframe, btc_lookback)
+
+            if df_btc_raw.empty or len(df_btc_raw) < 205: # Need enough for SMA200 + calculations
+                 logger.warning(f"API Scan: Insufficient BTC data ({len(df_btc_raw)} bars fetched/valid, need >204) for trend analysis on {request.timeframe}. Disabling BTC filter.")
+                 apply_btc_filter = False # Disable filter if not enough data
+            else:
+                df_btc_raw['symbol'] = btc_symbol # Add symbol for indicator logging
+                df_btc_indicators = await asyncio.to_thread(apply_technical_indicators, df_btc_raw)
+
+                # Check latest indicators for BTC
+                btc_latest = df_btc_indicators.iloc[-1]
+                btc_price = btc_latest.get('close')
+                btc_sma50 = btc_latest.get('SMA_50')
+                btc_sma200 = btc_latest.get('SMA_200')
+
+                if btc_price is not None and btc_sma50 is not None and btc_sma200 is not None and \
+                   np.isfinite(btc_price) and np.isfinite(btc_sma50) and np.isfinite(btc_sma200):
+
+                    if btc_price > btc_sma50 > btc_sma200:
+                        btc_trend_state = "UPTREND"
+                    elif btc_price < btc_sma50 < btc_sma200:
+                        btc_trend_state = "DOWNTREND"
+                    else:
+                        # Neither strictly up nor strictly down based on this definition
+                        btc_trend_state = "CHOPPY"
+
+                    logger.info(f"API Scan: Determined BTC Trend ({request.timeframe}): {btc_trend_state} (P: {btc_price:.2f}, S50: {btc_sma50:.2f}, S200: {btc_sma200:.2f})")
+                else:
+                    logger.warning(f"API Scan: Could not determine BTC trend (missing Price/SMA50/SMA200 values in latest BTC data). Disabling BTC filter. Latest BTC Indicators: {btc_latest.to_dict()}")
+                    apply_btc_filter = False
+                    btc_trend_state = "UNKNOWN"
+
+        except Exception as e:
+            logger.error(f"API Scan: Error fetching or analyzing BTC data: {e}. Disabling BTC filter.", exc_info=True)
+            apply_btc_filter = False
+            btc_trend_state = "ERROR"
+    else:
+        logger.info("API Scan: BTC Trend filter is disabled via request.")
+    # --- END NEW BTC TREND SECTION ---
+
+
+    # --- 3. Select Tickers ---
     tickers_to_scan = []
     total_available = len(all_tickers)
     start_index = request.ticker_start_index if request.ticker_start_index is not None else 0
     end_index = request.ticker_end_index
     slice_desc = ""
     actual_end_index_for_response = None
-    # (Logic for slicing based on start/end/max - unchanged)
-    if start_index >= total_available > 0: logger.warning("..."); return ScanResponse(...)
-    if start_index < 0: start_index = 0
-    # ... (determine tickers_to_scan based on end_index and max_tickers) ...
+
+    if start_index >= total_available > 0:
+        logger.warning(f"API Scan: Start index {start_index} out of bounds (>= total {total_available}). No tickers selected.")
+        return ScanResponse(scan_parameters=request, total_tickers_attempted=0, total_tickers_succeeded=0, ticker_start_index=start_index, ticker_end_index=end_index, total_opportunities_found=0, top_opportunities=[], errors={})
+    if start_index < 0:
+        logger.warning(f"API Scan: Negative start index {start_index}, adjusted to 0.")
+        start_index = 0
+
     # Determine the slice based on end_index and max_tickers
     if end_index is not None:
         if end_index <= start_index:
@@ -1342,69 +1423,76 @@ async def scan_market_endpoint(request: ScanRequest):
             tickers_to_scan = all_tickers[start_index:actual_end]
             slice_desc = f"requested slice [{start_index}:{end_index}], actual slice [{start_index}:{actual_end}]"
             actual_end_index_for_response = actual_end
-    # Use max_tickers ONLY if end_index is NOT specified
     elif request.max_tickers is not None and request.max_tickers > 0:
         limit = request.max_tickers
         actual_end = min(start_index + limit, total_available)
         tickers_to_scan = all_tickers[start_index:actual_end]
         slice_desc = f"using max_tickers={limit} from index {start_index}, actual slice [{start_index}:{actual_end}]"
         actual_end_index_for_response = actual_end
-    elif request.max_tickers == 0: # Explicit request for zero tickers
+    elif request.max_tickers == 0:
+         logger.warning("API Scan: max_tickers=0 requested. No tickers selected.")
          tickers_to_scan = []
          slice_desc = "max_tickers=0 requested"
-         actual_end_index_for_response = start_index # End is same as start if 0 requested
+         actual_end_index_for_response = start_index
     else: # No end_index, no max_tickers > 0 -> scan all from start_index
          tickers_to_scan = all_tickers[start_index:]
          actual_end = total_available
          slice_desc = f"scanning all from index {start_index}, actual slice [{start_index}:{actual_end}]"
-         actual_end_index_for_response = actual_end # End is the total count
+         actual_end_index_for_response = actual_end
 
-    logger.info(f"API Scan: Selected {len(tickers_to_scan)} tickers ({slice_desc}).")
+    logger.info(f"API Scan: Selected {len(tickers_to_scan)} tickers to analyze ({slice_desc}).")
     total_attempted = len(tickers_to_scan)
-    if total_attempted == 0: logger.info("..."); return ScanResponse(...)
 
-    # --- 3. Run Concurrently (Keep as is, using request.max_concurrent_tasks) ---
-    # ... (Setup semaphore, tasks, wrapper calling perform_single_analysis) ...
+    if total_attempted == 0:
+        logger.info("API Scan: No tickers selected based on criteria, ending scan early.")
+        return ScanResponse(scan_parameters=request, total_tickers_attempted=0, total_tickers_succeeded=0,
+                            ticker_start_index=start_index, ticker_end_index=actual_end_index_for_response,
+                            total_opportunities_found=0, top_opportunities=[], errors={})
+
+
+    # --- 4. Run Concurrently ---
     semaphore = asyncio.Semaphore(request.max_concurrent_tasks)
     tasks = []
     processed_count = 0
     progress_lock = asyncio.Lock()
-    log_interval = max(1, total_attempted // 20 if total_attempted > 0 else 1)
+    log_interval = max(1, total_attempted // 20 if total_attempted > 0 else 1) # Log ~5% progress
 
     async def analyze_with_semaphore_wrapper(ticker):
-        # (Wrapper function remains the same - calls perform_single_analysis)
         nonlocal processed_count
         result = None
         task_start_time = time.time()
         try:
             async with semaphore:
+                # logger.debug(f"API Scan: Acquired semaphore for {ticker}")
                 result = await perform_single_analysis(
                     symbol=ticker,
                     timeframe=request.timeframe,
                     lookback=request.lookback,
                     account_balance=request.accountBalance,
                     max_leverage=request.maxLeverage,
-                    min_requested_rr=request.min_risk_reward_ratio # Pass the value from the ScanRequest
+                    min_requested_rr=request.min_risk_reward_ratio # Pass R/R request
                 )
         except Exception as e:
             logger.error(f"API Scan Wrapper Error for {ticker}: {e}", exc_info=True)
             result = AnalysisResponse(symbol=ticker, timeframe=request.timeframe, error=f"Scan Wrapper Exception: {e}")
         finally:
-            # (Progress logging)
             task_duration = time.time() - task_start_time
-            async with progress_lock: processed_count += 1; current_count = processed_count
+            async with progress_lock:
+                processed_count += 1
+                current_count = processed_count
             if current_count % log_interval == 0 or current_count == total_attempted:
                  logger.info(f"API Scan Progress: {current_count}/{total_attempted} tasks completed (Last: {ticker} took {task_duration:.2f}s).")
         return result if result is not None else AnalysisResponse(symbol=ticker, timeframe=request.timeframe, error="Unknown wrapper state")
 
     logger.info(f"API Scan: Creating {total_attempted} analysis tasks...")
-    for ticker in tickers_to_scan: tasks.append(analyze_with_semaphore_wrapper(ticker))
+    for ticker in tickers_to_scan:
+        tasks.append(analyze_with_semaphore_wrapper(ticker))
 
     logger.info(f"API Scan: Gathering results for {total_attempted} tasks (Concurrency: {request.max_concurrent_tasks})...")
     analysis_results_raw: List[Any] = await asyncio.gather(*tasks, return_exceptions=True)
     logger.info(f"API Scan: Finished gathering {len(analysis_results_raw)} task results.")
 
-    # --- 4. Process Results (FILTERING LOGIC UPDATED) ---
+    # --- 5. Process Results ---
     successful_analyses_count = 0
     analysis_errors = {}
     opportunities_passing_filter = []
@@ -1432,19 +1520,16 @@ async def scan_market_endpoint(request: ScanRequest):
             if is_critical:
                 logger.error(f"API Scan: Critical error for [{result.symbol}]: {result.error}")
                 analysis_errors[result.symbol] = f"Analysis Critical Error: {result.error}"
-                continue
+                continue # Skip further processing
             elif result.error:
                  logger.warning(f"API Scan: Non-critical issue/warning for [{result.symbol}]: {result.error}")
-                 successful_analyses_count += 1 # Count as ran
+                 successful_analyses_count += 1 # Count as ran even with warnings
             else:
                  successful_analyses_count += 1 # Count error-free runs
 
-            # Extract data for filtering safely
-            gpt_params = result.gptParams
-            bt_results = result.backtest
-            indicators = result.indicators
+            # Extract data safely
+            gpt_params = result.gptParams; bt_results = result.backtest; indicators = result.indicators
             bt_analysis = bt_results.trade_analysis if bt_results else None
-
             direction = gpt_params.trade_direction if gpt_params else None
             gpt_conf = gpt_params.confidence_score if gpt_params and gpt_params.confidence_score is not None else None
             bt_score = bt_results.strategy_score if bt_results and bt_results.strategy_score is not None else None
@@ -1460,102 +1545,63 @@ async def scan_market_endpoint(request: ScanRequest):
                 f"PF={'inf' if bt_analysis and bt_analysis.profit_factor == float('inf') else f'{bt_analysis.profit_factor:.2f}' if bt_analysis and bt_analysis.profit_factor is not None else 'N/A'}, "
                 f"ADX={f'{indicators.ADX:.2f}' if indicators and indicators.ADX is not None else 'N/A'}"
             )
-            # --- End of CORRECTED Pre-filter Logging ---
 
-            # --- Filtering Logic with NEW Checks ---
+            # --- Filtering Logic ---
             passes_filters = True
             filter_fail_reason = ""
 
             # Filter 1: Basic Direction & Confidence/Score
-            if direction not in ['long', 'short']:
-                passes_filters = False; filter_fail_reason = f"Eval Direction not tradeable ('{direction}')"
-            elif request.trade_direction and direction != request.trade_direction:
-                passes_filters = False; filter_fail_reason = f"Direction mismatch (Req: {request.trade_direction}, Eval: {direction})"
-            elif gpt_conf is None or gpt_conf < request.min_gpt_confidence:
-                 passes_filters = False; filter_fail_reason = f"GPT Conf too low (Req > {request.min_gpt_confidence:.2f}, Got: {f'{gpt_conf:.2f}' if gpt_conf is not None else 'N/A'})" # Corrected format here
-            # <<< --- CORRECT THIS LINE --- >>>
-            elif bt_score is None or bt_score < request.min_backtest_score:
-                 # Use safe formatting for the log message part
-                 bt_score_str = f'{bt_score:.2f}' if bt_score is not None else 'N/A'
-                 passes_filters = False; filter_fail_reason = f"BT Score too low (Req > {request.min_backtest_score:.2f}, Got: {bt_score_str})"
-            # <<< --- END OF CORRECTION --- >>>
+            if direction not in ['long', 'short']: passes_filters = False; filter_fail_reason = f"Eval Direction not tradeable ('{direction}')"
+            elif request.trade_direction and direction != request.trade_direction: passes_filters = False; filter_fail_reason = f"Direction mismatch (Req: {request.trade_direction}, Eval: {direction})"
+            elif gpt_conf is None or gpt_conf < request.min_gpt_confidence: passes_filters = False; filter_fail_reason = f"GPT Conf too low (Req > {request.min_gpt_confidence:.2f}, Got: {f'{gpt_conf:.2f}' if gpt_conf is not None else 'N/A'})"
+            elif bt_score is None or bt_score < request.min_backtest_score: bt_score_str = f'{bt_score:.2f}' if bt_score is not None else 'N/A'; passes_filters = False; filter_fail_reason = f"BT Score too low (Req > {request.min_backtest_score:.2f}, Got: {bt_score_str})"
 
-            # Filter 2: Backtest Stats (only if previous filters passed)
-            elif passes_filters and bt_analysis is None:
-                 passes_filters = False; filter_fail_reason = "Backtest analysis missing"
-            elif passes_filters and request.min_backtest_trades is not None and (bt_analysis.total_trades < request.min_backtest_trades):
-                 passes_filters = False; filter_fail_reason = f"BT Trades too low (Req >= {request.min_backtest_trades}, Got: {bt_analysis.total_trades})"
-            # <<< --- CORRECT THIS LINE --- >>>
-            elif passes_filters and request.min_backtest_win_rate is not None and (bt_analysis.win_rate is None or bt_analysis.win_rate < request.min_backtest_win_rate):
-                 # Use safe formatting for the log message part
-                 wr_str = f'{bt_analysis.win_rate:.2%}' if bt_analysis.win_rate is not None else 'N/A'
-                 passes_filters = False; filter_fail_reason = f"BT Win Rate too low (Req >= {request.min_backtest_win_rate:.2%}, Got: {wr_str})"
-            # <<< --- END OF CORRECTION --- >>>
-            # <<< --- CORRECT THIS LINE --- >>>
-            elif passes_filters and request.min_backtest_profit_factor is not None and (bt_analysis.profit_factor is None or (bt_analysis.profit_factor != float('inf') and bt_analysis.profit_factor < request.min_backtest_profit_factor)):
-                 # Use safe formatting for the log message part
-                 pf_str = 'inf' if bt_analysis.profit_factor == float('inf') else f'{bt_analysis.profit_factor:.2f}' if bt_analysis.profit_factor is not None else 'N/A'
-                 # The condition already handles the logic, just need safe formatting for the reason string
-                 passes_filters = False; filter_fail_reason = f"BT Profit Factor too low (Req >= {request.min_backtest_profit_factor:.2f}, Got: {pf_str})"
-            # <<< --- END OF CORRECTION --- >>>
+            # Filter 2: Backtest Stats
+            elif passes_filters and bt_analysis is None: passes_filters = False; filter_fail_reason = "Backtest analysis missing"
+            elif passes_filters and request.min_backtest_trades is not None and (bt_analysis.total_trades < request.min_backtest_trades): passes_filters = False; filter_fail_reason = f"BT Trades too low (Req >= {request.min_backtest_trades}, Got: {bt_analysis.total_trades})"
+            elif passes_filters and request.min_backtest_win_rate is not None and (bt_analysis.win_rate is None or bt_analysis.win_rate < request.min_backtest_win_rate): wr_str = f'{bt_analysis.win_rate:.2%}' if bt_analysis.win_rate is not None else 'N/A'; passes_filters = False; filter_fail_reason = f"BT Win Rate too low (Req >= {request.min_backtest_win_rate:.2%}, Got: {wr_str})"
+            elif passes_filters and request.min_backtest_profit_factor is not None and (bt_analysis.profit_factor is None or (bt_analysis.profit_factor != float('inf') and bt_analysis.profit_factor < request.min_backtest_profit_factor)): pf_str = 'inf' if bt_analysis.profit_factor == float('inf') else f'{bt_analysis.profit_factor:.2f}' if bt_analysis.profit_factor is not None else 'N/A'; passes_filters = False; filter_fail_reason = f"BT Profit Factor too low (Req >= {request.min_backtest_profit_factor:.2f}, Got: {pf_str})"
 
-
-            # Filter 3: Risk/Reward Ratio (only if previous filters passed)
+            # Filter 3: Risk/Reward Ratio
             elif passes_filters and request.min_risk_reward_ratio is not None and request.min_risk_reward_ratio > 0:
-                entry = gpt_params.optimal_entry if gpt_params else None
-                sl = gpt_params.stop_loss if gpt_params else None
-                tp = gpt_params.take_profit if gpt_params else None
+                entry = gpt_params.optimal_entry if gpt_params else None; sl = gpt_params.stop_loss if gpt_params else None; tp = gpt_params.take_profit if gpt_params else None
                 rr_ratio = None
-                if entry is not None and sl is not None and tp is not None:
-                    risk = abs(entry - sl)
-                    reward = abs(tp - entry)
-                    if risk > 1e-9: rr_ratio = reward / risk
-                # <<< --- CORRECT THIS LINE --- >>>
-                if rr_ratio is None or rr_ratio < request.min_risk_reward_ratio:
-                     # Use safe formatting for the log message part
-                     rr_str = f'{rr_ratio:.2f}' if rr_ratio is not None else 'N/A'
-                     passes_filters = False; filter_fail_reason = f"R/R Ratio too low (Req >= {request.min_risk_reward_ratio:.2f}, Got: {rr_str})"
-                # <<< --- END OF CORRECTION --- >>>
+                if entry is not None and sl is not None and tp is not None: risk = abs(entry - sl); reward = abs(tp - entry); rr_ratio = reward / risk if risk > 1e-9 else None
+                if rr_ratio is None or rr_ratio < request.min_risk_reward_ratio: rr_str = f'{rr_ratio:.2f}' if rr_ratio is not None else 'N/A'; passes_filters = False; filter_fail_reason = f"R/R Ratio too low (Req >= {request.min_risk_reward_ratio:.2f}, Got: {rr_str})"
 
-
-            # Filter 4: Indicator Filters (ADX, SMA Alignment) (only if previous filters passed)
-            elif passes_filters and indicators is None:
-                 passes_filters = False; filter_fail_reason = "Indicator data missing"
-            # <<< --- CORRECT THIS LINE --- >>>
+            # Filter 4: Indicator Filters (ADX, SMA Alignment)
+            elif passes_filters and indicators is None: passes_filters = False; filter_fail_reason = "Indicator data missing"
             elif passes_filters and request.min_adx is not None and request.min_adx > 0:
                  adx = indicators.ADX
-                 if adx is None or adx < request.min_adx:
-                     # Use safe formatting for the log message part
-                     adx_str = f'{adx:.1f}' if adx is not None else 'N/A'
-                     passes_filters = False; filter_fail_reason = f"ADX too low (Req >= {request.min_adx:.1f}, Got: {adx_str})"
-            # <<< --- END OF CORRECTION --- >>>
-            # <<< --- CORRECT THIS LINE --- >>>
+                 if adx is None or adx < request.min_adx: adx_str = f'{adx:.1f}' if adx is not None else 'N/A'; passes_filters = False; filter_fail_reason = f"ADX too low (Req >= {request.min_adx:.1f}, Got: {adx_str})"
             elif passes_filters and request.require_sma_alignment:
-                 sma50 = indicators.SMA_50
-                 sma200 = indicators.SMA_200
-                 price = current_price
-                 sma_aligned = False
-                 # Use safe formatting for the log message part
-                 price_str = f'{price:.4f}' if price is not None else 'N/A'
-                 sma50_str = f'{sma50:.4f}' if sma50 is not None else 'N/A'
-                 sma200_str = f'{sma200:.4f}' if sma200 is not None else 'N/A'
+                 sma50 = indicators.SMA_50; sma200 = indicators.SMA_200; price = current_price; sma_aligned = False
+                 price_str = f'{price:.4f}' if price is not None else 'N/A'; sma50_str = f'{sma50:.4f}' if sma50 is not None else 'N/A'; sma200_str = f'{sma200:.4f}' if sma200 is not None else 'N/A'
                  if price is not None and sma50 is not None and sma200 is not None:
                      if direction == 'long' and price > sma50 > sma200: sma_aligned = True
                      elif direction == 'short' and price < sma50 < sma200: sma_aligned = True
-                 if not sma_aligned:
-                     passes_filters = False; filter_fail_reason = f"SMA alignment failed (Req: {request.require_sma_alignment}, Dir: {direction}, P:{price_str}, S50:{sma50_str}, S200:{sma200_str})"
-            # <<< --- END OF CORRECTION --- >>>
+                 if not sma_aligned: passes_filters = False; filter_fail_reason = f"SMA alignment failed (Req: {request.require_sma_alignment}, Dir: {direction}, P:{price_str}, S50:{sma50_str}, S200:{sma200_str})"
 
-            # --- Add Opportunity if Passes All Filters ---
+            # --- Filter 5: BTC Trend Alignment ---
+            elif passes_filters and apply_btc_filter: # Only apply if requested AND BTC state is known and not error/unknown
+                if btc_trend_state in ["UPTREND", "DOWNTREND", "CHOPPY"]: # Ensure we have a valid state
+                    if direction == 'long' and btc_trend_state != 'UPTREND':
+                        passes_filters = False; filter_fail_reason = f"BTC Trend not UPTREND (Is: {btc_trend_state})"
+                    elif direction == 'short' and btc_trend_state != 'DOWNTREND':
+                        passes_filters = False; filter_fail_reason = f"BTC Trend not DOWNTREND (Is: {btc_trend_state})"
+                    # else: Allow trade if direction matches trend or if BTC is choppy (optional: could filter out choppy too)
+                else: # If BTC state is UNKNOWN or ERROR, the filter effectively does nothing (or could be stricter)
+                    logger.debug(f"[{result.symbol}] Skipping BTC trend filter application due to BTC state: {btc_trend_state}")
+
+
+            # Add Opportunity if Passes All Filters
             if passes_filters:
                 logger.info(f"[{result.symbol}] PASSED ALL FILTERS. Adding to opportunities.")
-                # Calculate combined score (same as before)
                 score_g = float(gpt_conf) if gpt_conf is not None else 0.0
                 score_b = float(bt_score) if bt_score is not None else 0.0
-                combined_score = round((score_g * 0.6) + (score_b * 0.4), 3) # Example: 60% GPT, 40% BT
+                combined_score = round((score_g * 0.6) + (score_b * 0.4), 3) # Adjust weighting as needed
 
-                # Extract summary (same as before)
-                summary = "Analysis unavailable."
+                summary = "Analysis unavailable." # Default
                 if result.gptAnalysis:
                     eval_text = result.gptAnalysis.signal_evaluation; tech_text = result.gptAnalysis.technical_analysis
                     if eval_text and isinstance(eval_text, str) and "Error:" not in eval_text: summary = eval_text.split('.')[0] + '.'
@@ -1575,7 +1621,6 @@ async def scan_market_endpoint(request: ScanRequest):
                 )
                 opportunities_passing_filter.append(opportunity)
             else:
-                 # Log *why* it failed if it didn't pass
                  logger.info(f"[{result.symbol}] FAILED FILTERS. Reason: {filter_fail_reason}.")
 
         # Unexpected type handling
@@ -1586,26 +1631,30 @@ async def scan_market_endpoint(request: ScanRequest):
     # --- End of Result Processing Loop ---
     logger.info(f"API Scan: Finished processing results. Succeeded: {successful_analyses_count}, Errors: {len(analysis_errors)}, Passed Filters: {len(opportunities_passing_filter)}.")
 
-    # --- 5. Rank Opportunities (Keep as is) ---
+    # --- 6. Rank Opportunities ---
     if opportunities_passing_filter:
         logger.info(f"API Scan: Sorting {len(opportunities_passing_filter)} opportunities...")
         opportunities_passing_filter.sort(key=lambda x: x.combinedScore or 0.0, reverse=True)
         top_opportunities = []
         for rank_idx, opp in enumerate(opportunities_passing_filter[:request.top_n]):
             opp.rank = rank_idx + 1; top_opportunities.append(opp)
-        logger.info(f"API Scan: Ranking complete. Top {len(top_opportunities)} selected.")
-    else: logger.info("API Scan: No opportunities passed filters."); top_opportunities = []
+        logger.info(f"API Scan: Ranking complete. Selected top {len(top_opportunities)}.")
+    else:
+        logger.info("API Scan: No opportunities passed filters.")
+        top_opportunities = []
 
-    # --- 6. Construct Final Response (Keep as is) ---
+    # --- 7. Construct Final Response ---
     scan_duration = time.time() - scan_start_time
     logger.info(f"API Scan: Completed in {scan_duration:.2f}s. Returning response.")
-    if analysis_errors: logger.warning(f"API Scan finished with errors for symbols: {list(analysis_errors.keys())}")
+    if analysis_errors:
+        logger.warning(f"API Scan finished with {len(analysis_errors)} critical errors/exceptions for symbols: {list(analysis_errors.keys())}")
+
     return ScanResponse(
         scan_parameters=request,
         total_tickers_attempted=total_attempted,
         total_tickers_succeeded=successful_analyses_count,
-        ticker_start_index=start_index, # Use actual start index used
-        ticker_end_index=actual_end_index_for_response, # Use actual end index used
+        ticker_start_index=start_index,
+        ticker_end_index=actual_end_index_for_response,
         total_opportunities_found=len(opportunities_passing_filter),
         top_opportunities=top_opportunities,
         errors=analysis_errors
