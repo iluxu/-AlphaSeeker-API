@@ -1,0 +1,11 @@
+pandas
+numpy
+ccxt
+arch
+scikit-learn
+# tensorflow # Or tensorflow-cpu if not using GPU (LSTM currently disabled) - Remove if TF fully unused
+openai
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic
