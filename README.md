@@ -1,5 +1,3 @@
-Okay, let's inject some more excitement and appeal into the README.md to grab attention, while still keeping the important disclaimers. We'll focus on the potential and the "AI" aspect, using stronger verbs and highlighting the key value propositions.
-
 # AlphaSeeker API 🚀 - Your AI-Powered Crypto Market Scanner & Analysis Engine
 
 **Unlock potential trading opportunities in the fast-paced crypto markets with the AlphaSeeker API!** This powerful FastAPI backend leverages technical analysis, statistical modeling, and cutting-edge AI (GPT-4o) to scan Binance Futures, evaluate signals, and identify potential setups based on your custom criteria.
