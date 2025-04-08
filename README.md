@@ -81,26 +81,3 @@ AlphaSeeker is a powerful starting point, but remember:
 ## Contributing
 
 Got ideas? Found a bug? Contributions are welcome! Please open an issue or submit a Pull Request.
-
-## License
-
-MIT License (Add a `LICENSE` file if desired).
-
-
-Key Changes for Appeal:
-
-Catchy Title & Emojis: "AlphaSeeker API 🚀", "⚡️", "🔥", "🤖", "⚙️" add visual interest.
-
-Stronger Opening: Emphasizes unlocking opportunities and AI power.
-
-Benefit-Oriented Features: Phrased features more around what the user gains (e.g., "Blazing Fast Scans", "Intelligent Signal Triggering", "AI-Powered Evaluation").
-
-Action Verbs: Used words like "Unlock", "Unleash", "Deep-dive".
-
-Clear Call to Action: Simplified the running instructions.
-
-Roadmap Hint: Briefly mentioned future possibilities to show ongoing potential.
-
-Retained Disclaimers: Kept the crucial warnings prominent (using ⚠️ emoji).
-
-Remember to replace <your_github_repo_url> in the README with the actual URL after you create the repository and push the code. Good luck!
