@@ -917,22 +917,52 @@ async def perform_single_analysis(
         return analysis_result # Stop if basic data/indicators fail
 
 
-    # --- Step 2.5: Determine Technical Trigger (RSI ONLY - VERY SIMPLE) ---
+    # --- Step 2.5: Determine Technical Trigger (MACD Cross + SMA200 Trend + ADX) ---
     technical_signal_direction = "hold" # Default
-    latest_rsi = analysis_result.indicators.RSI if analysis_result.indicators else None
-    rsi_oversold_trigger = 35
-    rsi_overbought_trigger = 65
+    price = analysis_result.currentPrice
+    sma200 = analysis_result.indicators.SMA_200 if analysis_result.indicators else None
+    latest_adx = analysis_result.indicators.ADX if analysis_result.indicators else None
+    macd_line = analysis_result.indicators.MACD if analysis_result.indicators else None
+    signal_line = analysis_result.indicators.Signal_Line if analysis_result.indicators else None
+    min_adx_for_trigger = 20 # Minimum ADX for trend strength
 
-    # Determine Trigger based ONLY on RSI level
-    if latest_rsi is not None and np.isfinite(latest_rsi):
-        if latest_rsi < rsi_oversold_trigger:
-            technical_signal_direction = "long"
-        elif latest_rsi > rsi_overbought_trigger:
-            technical_signal_direction = "short"
+    # Get previous bar's MACD values for crossover detection
+    prev_macd_line = None
+    prev_signal_line = None
+    if df_indicators is not None and len(df_indicators) > 1:
+        prev_indicators_raw = df_indicators.iloc[-2].to_dict() # Get second to last row
+        prev_macd_line = prev_indicators_raw.get('MACD')
+        prev_signal_line = prev_indicators_raw.get('Signal_Line')
 
-    # Log the outcome
-    rsi_str = f'{latest_rsi:.2f}' if latest_rsi is not None else 'N/A'
-    logger.info(f"{log_prefix} Technical signal trigger: {technical_signal_direction.upper()} (RSI: {rsi_str})")
+    # Pre-calculate conditions
+    has_data = all(v is not None and np.isfinite(v) for v in [price, sma200, latest_adx, macd_line, signal_line, prev_macd_line, prev_signal_line])
+    is_trending_up = has_data and price > sma200
+    is_trending_down = has_data and price < sma200
+    is_adx_strong = has_data and latest_adx >= min_adx_for_trigger
+    # MACD Crossover conditions
+    macd_crossed_up = has_data and prev_macd_line <= prev_signal_line and macd_line > signal_line
+    macd_crossed_down = has_data and prev_macd_line >= prev_signal_line and macd_line < signal_line
+
+    # Determine Signal based on combined conditions
+    if is_trending_up and macd_crossed_up and is_adx_strong:
+        technical_signal_direction = "long"
+    elif is_trending_down and macd_crossed_down and is_adx_strong:
+        technical_signal_direction = "short"
+    # All other combinations result in "hold"
+
+    # Log the outcome and conditions clearly
+    macd_cross_log = "MACD Cross: N/A"
+    if has_data:
+        if macd_crossed_up: macd_cross_log = f"MACD Cross: UP ({macd_line:.4f} > {signal_line:.4f})"
+        elif macd_crossed_down: macd_cross_log = f"MACD Cross: DOWN ({macd_line:.4f} < {signal_line:.4f})"
+        else: macd_cross_log = f"MACD Cross: None ({macd_line:.4f} vs {signal_line:.4f})"
+
+    trend_log = f"Trend: {'UP' if is_trending_up else 'DOWN' if is_trending_down else 'CHOPPY/NA'}"
+    adx_log = f"ADX: {f'{latest_adx:.2f}' if latest_adx is not None else 'N/A'}"
+
+    logger.info(f"{log_prefix} Technical signal trigger: {technical_signal_direction.upper()} "
+                f"({macd_cross_log}, {trend_log}, TrendOK: {is_trending_up or is_trending_down}, "
+                f"{adx_log}, ADX_OK: {is_adx_strong})")
     # --- End of Step 2.5 ---
 
 
